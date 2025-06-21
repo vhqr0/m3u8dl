@@ -67,6 +67,19 @@ def parse_m3u8(text: str):
     return headers, trunks
 
 
+def parse_m3u8_key(text: str):
+    key = {}
+    for kv in text.split(","):
+        kv = kv.strip()
+        k, v = kv.split("=", 1)
+        k, v = k.strip(), v.strip()
+        match_result = re.match('^"(.*)"$', v)
+        if match_result is not None:
+            v = match_result[1].strip()
+        key[k] = v
+    return key
+
+
 class M3U8Downloader:
     def __init__(self, url, http_headers, download_path="download/", check_mode=False):
         base_url, m3u8 = url.rsplit("/", 1)
@@ -113,20 +126,15 @@ class M3U8Downloader:
             self.crypt_mode = False
         else:
             self.crypt_mode = True
-            key = self.m3u8_headers["#EXT-X-KEY"]
-            crypt_method, key_uri, iv = key.split(",", 2)
-            if not crypt_method.startswith("METHOD=AES-"):
-                raise Exception("Invalid Method", crypt_method)
-            match_result = re.match('^URI="(.*)"$', key_uri)
-            if match_result is None:
-                raise Exception("Invalid key uri", key_uri)
-            self.key_uri = match_result[1]
-            if not iv.startswith("IV=0x"):
-                raise Exception("Invalid iv", iv)
-            self.iv = bytes.fromhex(iv[5:])
+            self.m3u8_key = parse_m3u8_key(self.m3u8_headers["#EXT-X-KEY"])
+            if not self.m3u8_key["METHOD"].startswith("AES-"):
+                raise Exception("Invalid method", self.m3u8_key)
+            if not self.m3u8_key["IV"].startswith("0x"):
+                raise Exception("Invalid iv", self.m3u8_key)
+            self.iv = bytes.fromhex(self.m3u8_key["IV"][2:])
             print("Fetch crypt key...")
-            self.ensure_download(self.key_uri)
-            self.key = self.read_bytes(self.key_uri)
+            self.ensure_download(self.m3u8_key["URI"])
+            self.key = self.read_bytes(self.m3u8_key["URI"])
 
     def fetch_trunks(self):
         print("Fetch trunks...")
@@ -159,8 +167,12 @@ class M3U8Downloader:
                     if self.check_mode:
                         raise Exception("Target not exists:", trunk)
 
+    def maybe_decrypt_trunks(self):
+        if self.crypt_mode:
+            self.decrypt_trunks()
+
     def gen_list(self):
-        with open(self.decrypt_path + "_videos.txt", "w") as f:
+        with open(self.download_path + "_videos.txt", "w") as f:
             for trunk in self.m3u8_trunks:
                 if not self.crypt_mode:
                     name = trunk
