@@ -5,6 +5,26 @@ import requests
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 
+def read_bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def write_bytes(path, data):
+    with open(path, "wb") as f:
+        return f.write(data)
+
+
+def read_text(path):
+    with open(path, "r") as f:
+        return f.read()
+
+
+def read_json(path):
+    with open(path, "r") as f:
+        return json.load(f)
+
+
 def request_bytes(url, headers):
     resp = requests.get(url, headers=headers)
     resp.raise_for_status()
@@ -16,8 +36,7 @@ def ensure_download(url, headers, path):
         print("Target already exists:", path)
     else:
         data = request_bytes(url, headers)
-        with open(path, "wb") as f:
-            f.write(data)
+        write_bytes(path, data)
 
 
 def decrypt_aes(key, iv, data):
@@ -27,6 +46,15 @@ def decrypt_aes(key, iv, data):
     decryptor = cipher.decryptor()
     data = decryptor.update(data) + decryptor.finalize()
     return data
+
+
+def ensure_decrypt(key, iv, enc_path, dec_path):
+    if os.path.exists(dec_path):
+        print("Target already exists:", dec_path)
+    else:
+        enc = read_bytes(enc_path)
+        dec = decrypt_aes(key, iv, enc)
+        write_bytes(dec_path, dec)
 
 
 def parse_m3u8(text: str):
@@ -91,31 +119,37 @@ class M3U8Downloader:
 
     @classmethod
     def from_json(cls, json_path, check_mode=False):
-        with open(json_path, "r") as f:
-            params = json.load(f)
+        params = read_json(json_path)
         url = params["url"]
         headers = params["headers"]
         return cls(url, headers, check_mode=check_mode)
 
-    def ensure_download(self, name):
-        if self.check_mode:
-            path = self.download_path + name
-            if not os.path.exists(path):
-                raise Exception("Target not exists:", name)
-        else:
-            url = self.base_url + name
-            path = self.download_path + name
-            ensure_download(url, self.http_headers, path)
-
     def read_bytes(self, name):
         path = self.download_path + name
-        with open(path, "rb") as f:
-            return f.read()
+        return read_bytes(path)
 
     def read_text(self, name):
         path = self.download_path + name
-        with open(path, "r") as f:
-            return f.read()
+        return read_text(path)
+
+    def ensure_download(self, name):
+        path = self.download_path + name
+        if self.check_mode:
+            if not os.path.exists(path):
+                raise Exception("Download target not exists:", name)
+        else:
+            url = self.base_url + name
+            ensure_download(url, self.http_headers, path)
+
+    def ensure_decrypt(self, name):
+        if self.crypt_mode:
+            enc_path = self.download_path + name
+            dec_path = enc_path + "._decrypt.ts"
+            if self.check_mode:
+                if not os.path.exists(dec_path):
+                    raise Exception("Decrypt target not exists:", name)
+            else:
+                ensure_decrypt(self.key, self.iv, enc_path, dec_path)
 
     def fetch_m3u8(self):
         print("Fetch m3u8...")
@@ -143,33 +177,11 @@ class M3U8Downloader:
         for i, trunk in enumerate(trunks):
             print(f"Fetch trunk {i}/{total}...")
             self.ensure_download(trunk)
+            self.ensure_decrypt(trunk)
 
     def fetch(self):
         self.fetch_m3u8()
         self.fetch_trunks()
-
-    def decrypt_trunks(self):
-        print("Decrypt trunks...")
-        trunks = self.m3u8_trunks
-        total = len(trunks)
-        for i, trunk in enumerate(trunks):
-            print(f"Decrypt trunk {i}/{total}...")
-            path = self.download_path + trunk + "._decrypt.ts"
-            if os.path.exists(path):
-                print("Target already exists:", trunk)
-            else:
-                if os.path.exists(self.download_path + trunk):
-                    enc = self.read_bytes(trunk)
-                    dec = decrypt_aes(self.key, self.iv, enc)
-                    with open(path, "wb") as f:
-                        f.write(dec)
-                else:
-                    if self.check_mode:
-                        raise Exception("Target not exists:", trunk)
-
-    def maybe_decrypt_trunks(self):
-        if self.crypt_mode:
-            self.decrypt_trunks()
 
     def gen_list(self):
         with open(self.download_path + "_videos.txt", "w") as f:
