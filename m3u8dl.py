@@ -1,7 +1,9 @@
 import os.path
+import io
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
 import re
 import json
-from concurrent.futures import ThreadPoolExecutor
 import requests
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -19,6 +21,11 @@ def write_bytes(path, data):
 def read_text(path):
     with open(path, "r") as f:
         return f.read()
+
+
+def write_text(path, data):
+    with open(path, "w") as f:
+        return f.write(data)
 
 
 def read_json(path):
@@ -110,20 +117,31 @@ def parse_m3u8_key(text: str):
 
 
 class M3U8Downloader:
-    def __init__(self, url, http_headers, download_path="download/", check_mode=False):
-        base_url, m3u8 = url.rsplit("/", 1)
-        self.base_url = base_url + "/"
-        self.m3u8 = m3u8
-        self.http_headers = http_headers
+    def __init__(
+        self,
+        url,
+        headers,
+        download_path="download/",
+        index_name="_index.txt",
+        output_name="_output.mp4",
+        async_max_workers=10,
+        check_mode=False,
+    ):
+        self.base_url, self.m3u8_meta = url.rsplit("/", 1)
+        self.base_url += "/"
+        self.headers = headers
         self.download_path = download_path
+        self.index_name = index_name
+        self.output_name = output_name
+        self.async_max_workers = async_max_workers
         self.check_mode = check_mode
 
     @classmethod
-    def from_json(cls, json_path, check_mode=False):
+    def from_json(cls, json_path, **kwargs):
         params = read_json(json_path)
         url = params["url"]
         headers = params["headers"]
-        return cls(url, headers, check_mode=check_mode)
+        return cls(url, headers, **kwargs)
 
     def read_bytes(self, name):
         path = self.download_path + name
@@ -140,69 +158,88 @@ class M3U8Downloader:
                 raise Exception("Download target not exists:", name)
         else:
             url = self.base_url + name
-            ensure_download(url, self.http_headers, path)
+            ensure_download(url, self.headers, path)
 
     def ensure_decrypt(self, name):
-        if self.crypt_mode:
-            enc_path = self.download_path + name
-            dec_path = enc_path + "._decrypt.ts"
-            if self.check_mode:
-                if not os.path.exists(dec_path):
-                    raise Exception("Decrypt target not exists:", name)
-            else:
-                ensure_decrypt(self.key, self.iv, enc_path, dec_path)
+        enc_path = self.download_path + name
+        dec_path = enc_path + "._decrypt.ts"
+        if self.check_mode:
+            if not os.path.exists(dec_path):
+                raise Exception("Decrypt target not exists:", name)
+        else:
+            ensure_decrypt(self.key, self.iv, enc_path, dec_path)
 
-    def fetch_m3u8(self):
-        print("Fetch m3u8...")
-        self.ensure_download(self.m3u8)
-        text = self.read_text(self.m3u8)
-        self.m3u8_headers, self.m3u8_trunks = parse_m3u8(text)
+    def fetch_meta(self):
+        print("Fetch m3u8 meta...")
+        self.ensure_download(self.m3u8_meta)
+        self.m3u8_meta = self.read_text(self.m3u8_meta)
+        self.m3u8_headers, self.m3u8_trunks = parse_m3u8(self.m3u8_meta)
         if "#EXT-X-KEY" not in self.m3u8_headers:
             self.crypt_mode = False
         else:
             self.crypt_mode = True
-            self.m3u8_key = parse_m3u8_key(self.m3u8_headers["#EXT-X-KEY"])
-            if not self.m3u8_key["METHOD"].startswith("AES-"):
-                raise Exception("Invalid method", self.m3u8_key)
-            if not self.m3u8_key["IV"].startswith("0x"):
-                raise Exception("Invalid iv", self.m3u8_key)
-            self.iv = bytes.fromhex(self.m3u8_key["IV"][2:])
-            print("Fetch crypt key...")
-            self.ensure_download(self.m3u8_key["URI"])
-            self.key = self.read_bytes(self.m3u8_key["URI"])
+            self.fetch_crypt_key()
 
-    def fetch_trunk(self, trunk, i, total):
-        print(f"Fetch trunk {i}/{total}...")
+    def fetch_crypt_key(self):
+        self.m3u8_key = parse_m3u8_key(self.m3u8_headers["#EXT-X-KEY"])
+        if not self.m3u8_key["METHOD"].startswith("AES-"):
+            raise Exception("Invalid method", self.m3u8_key)
+        if not self.m3u8_key["IV"].startswith("0x"):
+            raise Exception("Invalid iv", self.m3u8_key)
+        self.iv = bytes.fromhex(self.m3u8_key["IV"][2:])
+        print("Fetch crypt key...")
+        self.ensure_download(self.m3u8_key["URI"])
+        self.key = self.read_bytes(self.m3u8_key["URI"])
+
+    def fetch_trunk(self, i):
+        trunks = self.m3u8_trunks
+        trunk = trunks[i]
+        print(f"Fetch trunk {i}/{len(trunks) - 1}...")
         self.ensure_download(trunk)
-        self.ensure_decrypt(trunk)
+        if self.crypt_mode:
+            self.ensure_decrypt(trunk)
 
     def fetch_trunks(self):
         print("Fetch trunks...")
-        trunks = self.m3u8_trunks
-        total = len(trunks)
-        for i, trunk in enumerate(trunks):
-            self.fetch_trunk(trunk, i, total)
+        for i in range(len(self.m3u8_trunks)):
+            self.fetch_trunk(i)
+
+    def fetch_trunks_async(self):
+        print("Fetch trunks...")
+        with ThreadPoolExecutor(max_workers=self.async_max_workers) as executor:
+            executor.map(self.fetch_trunk, range(len(self.m3u8_trunks)))
 
     def fetch(self):
-        self.fetch_m3u8()
+        self.fetch_meta()
         self.fetch_trunks()
 
-    def fetch_trunks_async(self, max_workers=10):
-        print("Fetch trunks...")
-        trunks = self.m3u8_trunks
-        total = len(trunks)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            executor.map(lambda i: self.fetch_trunk(trunks[i], i, total), range(total))
+    def fetch_async(self):
+        self.fetch_meta()
+        self.fetch_trunks_async()
 
-    def fetch_async(self, max_workers=10):
-        self.fetch_m3u8()
-        self.fetch_trunks_async(max_workers=max_workers)
+    def gen_index(self):
+        print("Generate index...")
+        sio = io.StringIO()
+        for trunk in self.m3u8_trunks:
+            if not self.crypt_mode:
+                name = trunk
+            else:
+                name = trunk + "._decrypt.ts"
+            print(f"file '{name}'", file=sio)
+        write_text(self.download_path + self.index_name, sio.getvalue())
 
-    def gen_list(self):
-        with open(self.download_path + "_videos.txt", "w") as f:
-            for trunk in self.m3u8_trunks:
-                if not self.crypt_mode:
-                    name = trunk
-                else:
-                    name = trunk + "._decrypt.ts"
-                print(f"file '{name}'", file=f)
+    def ffmpeg_concat(self):
+        print("Concat videos...")
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-f",
+                "concat",
+                "-i",
+                self.index_name,
+                "-c",
+                "copy",
+                self.output_name,
+            ],
+            cwd=self.download_path,
+        )
