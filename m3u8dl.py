@@ -1,6 +1,7 @@
 import os.path
 import re
 import json
+from concurrent.futures import ThreadPoolExecutor
 import requests
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -170,18 +171,32 @@ class M3U8Downloader:
             self.ensure_download(self.m3u8_key["URI"])
             self.key = self.read_bytes(self.m3u8_key["URI"])
 
+    def fetch_trunk(self, trunk, i, total):
+        print(f"Fetch trunk {i}/{total}...")
+        self.ensure_download(trunk)
+        self.ensure_decrypt(trunk)
+
     def fetch_trunks(self):
         print("Fetch trunks...")
         trunks = self.m3u8_trunks
         total = len(trunks)
         for i, trunk in enumerate(trunks):
-            print(f"Fetch trunk {i}/{total}...")
-            self.ensure_download(trunk)
-            self.ensure_decrypt(trunk)
+            self.fetch_trunk(trunk, i, total)
 
     def fetch(self):
         self.fetch_m3u8()
         self.fetch_trunks()
+
+    def fetch_trunks_async(self, max_workers=10):
+        print("Fetch trunks...")
+        trunks = self.m3u8_trunks
+        total = len(trunks)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            executor.map(lambda i: self.fetch_trunk(trunks[i], i, total), range(total))
+
+    def fetch_async(self, max_workers=10):
+        self.fetch_m3u8()
+        self.fetch_trunks_async(max_workers=max_workers)
 
     def gen_list(self):
         with open(self.download_path + "_videos.txt", "w") as f:
