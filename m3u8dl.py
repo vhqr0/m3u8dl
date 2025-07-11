@@ -191,8 +191,8 @@ class M3U8Downloader:
     def fetch_meta(self):
         print("Fetch m3u8 meta...")
         self.ensure_download(self.m3u8_meta)
-        self.m3u8_meta = self.read_text(self.m3u8_meta)
-        self.m3u8_headers, self.m3u8_trunks = M3U8Parser.parse(self.m3u8_meta)
+        m3u8_meta = self.read_text(self.m3u8_meta)
+        self.m3u8_headers, self.m3u8_trunks = M3U8Parser.parse(m3u8_meta)
         if "KEY" not in self.m3u8_headers:
             self.crypt_mode = False
         else:
