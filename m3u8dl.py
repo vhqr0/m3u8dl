@@ -2,6 +2,7 @@ import os.path
 import io
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
+import enum
 import re
 import json
 import requests
@@ -65,46 +66,11 @@ def ensure_decrypt(key, iv, enc_path, dec_path):
         write_bytes(dec_path, dec)
 
 
-def parse_m3u8(text: str):
-    stage = "init"
-    headers = {}
-    trunks = []
-    for line in text.splitlines():
-        line = line.strip()
-        if stage == "init":
-            if line == "#EXTM3U":
-                stage = "header-or-trunk-key-or-end"
-            else:
-                raise Exception("Invalid init", stage, line)
-        elif stage == "header-or-trunk-key-or-end":
-            if line == "#EXT-X-ENDLIST":
-                stage = "end"
-            elif line.startswith("#EXT-X"):
-                k, v = line.split(":", 1)
-                headers[k] = v
-            elif line.startswith("#EXTINF"):
-                stage = "trunk-value"
-            else:
-                raise Exception("Invalid header or trunk key or end", stage, line)
-        elif stage == "trunk-key-or-end":
-            if line == "#EXT-X-ENDLIST":
-                stage = "end"
-            elif line.startswith("#EXTINF"):
-                stage = "trunk-value"
-            else:
-                raise Exception("Invalid trunk key or end", stage, line)
-        elif stage == "trunk-value":
-            trunks.append(line)
-            stage = "trunk-key-or-end"
-        else:
-            raise Exception("Invalid stage", stage)
-    if stage != "end":
-        raise Exception("Parse not end", stage)
-    return headers, trunks
-
-
-def parse_m3u8_key(text: str):
-    key = {}
+def parse_simple_kv_list(text: str):
+    """Parse simple key-value list string, like: a=1,b=2,c=3.
+    Repect \"XXX\" as XXX.
+    """
+    d = {}
     for kv in text.split(","):
         kv = kv.strip()
         k, v = kv.split("=", 1)
@@ -112,8 +78,73 @@ def parse_m3u8_key(text: str):
         match_result = re.match('^"(.*)"$', v)
         if match_result is not None:
             v = match_result[1].strip()
-        key[k] = v
-    return key
+        d[k] = v
+    return d
+
+
+class M3U8Parser:
+    class Stage(enum.Enum):
+        init = enum.auto()
+        header_or_trunk_key_or_end = enum.auto()
+        trunk_key_or_end = enum.auto()
+        trunk_value = enum.auto()
+        end = enum.auto()
+
+    def __init__(self):
+        self.stage = self.Stage.init
+        self.headers = {}
+        self.trunks = []
+
+    @classmethod
+    def parse(cls, text: str):
+        parser = cls()
+        for line in text.splitlines():
+            parser.input(line.strip())
+        if parser.stage is not parser.Stage.end:
+            raise Exception("Parse not end", parser.stage)
+        return parser.headers, parser.trunks
+
+    def input(self, line: str):
+        match self.stage:
+            case self.Stage.init:
+                self.input_init(line)
+            case self.Stage.header_or_trunk_key_or_end:
+                self.input_header_or_trunk_key_or_end(line)
+            case self.Stage.trunk_key_or_end:
+                self.input_trunk_key_or_end(line)
+            case self.Stage.trunk_value:
+                self.input_trunk_value(line)
+            case _:
+                raise Exception("Invalid stage", self.stage)
+
+    def input_init(self, line: str):
+        if line == "#EXTM3U":
+            self.stage = self.Stage.header_or_trunk_key_or_end
+        else:
+            raise Exception("Invalid init", line)
+
+    def input_header_or_trunk_key_or_end(self, line: str):
+        if line == "#EXT-X-ENDLIST":
+            self.stage = self.Stage.end
+        elif line.startswith("#EXT-X"):
+            k, v = line.split(":", 1)
+            self.headers[k] = v
+        elif line.startswith("#EXTINF"):
+            self.stage = self.Stage.trunk_value
+        else:
+            raise Exception("Invalid header or trunk key or end", line)
+
+    def input_trunk_key_or_end(self, line: str):
+        if line == "#EXT-X-ENDLIST":
+            self.stage = self.Stage.end
+        elif line.startswith("#EXTINF"):
+            self.stage = self.Stage.trunk_value
+        else:
+            raise Exception("Invalid trunk key or end", line)
+
+    def input_trunk_value(self, line: str):
+        self.trunks.append(line)
+        self.stage = self.Stage.trunk_key_or_end
 
 
 class M3U8Downloader:
@@ -173,7 +204,7 @@ class M3U8Downloader:
         print("Fetch m3u8 meta...")
         self.ensure_download(self.m3u8_meta)
         self.m3u8_meta = self.read_text(self.m3u8_meta)
-        self.m3u8_headers, self.m3u8_trunks = parse_m3u8(self.m3u8_meta)
+        self.m3u8_headers, self.m3u8_trunks = M3U8Parser.parse(self.m3u8_meta)
         if "#EXT-X-KEY" not in self.m3u8_headers:
             self.crypt_mode = False
         else:
@@ -181,20 +212,20 @@ class M3U8Downloader:
             self.fetch_crypt_key()
 
     def fetch_crypt_key(self):
-        self.m3u8_key = parse_m3u8_key(self.m3u8_headers["#EXT-X-KEY"])
-        if not self.m3u8_key["METHOD"].startswith("AES-"):
-            raise Exception("Invalid method", self.m3u8_key)
-        if not self.m3u8_key["IV"].startswith("0x"):
-            raise Exception("Invalid iv", self.m3u8_key)
-        self.iv = bytes.fromhex(self.m3u8_key["IV"][2:])
+        self.m3u8_key_meta = parse_simple_kv_list(self.m3u8_headers["#EXT-X-KEY"])
+        if not self.m3u8_key_meta["METHOD"].startswith("AES-"):
+            raise Exception("Invalid method", self.m3u8_key_meta)
+        if not self.m3u8_key_meta["IV"].startswith("0x"):
+            raise Exception("Invalid iv", self.m3u8_key_meta)
+        self.iv = bytes.fromhex(self.m3u8_key_meta["IV"][2:])
         print("Fetch crypt key...")
-        self.ensure_download(self.m3u8_key["URI"])
-        self.key = self.read_bytes(self.m3u8_key["URI"])
+        self.ensure_download(self.m3u8_key_meta["URI"])
+        self.key = self.read_bytes(self.m3u8_key_meta["URI"])
 
     def fetch_trunk(self, i):
         trunks = self.m3u8_trunks
         trunk = trunks[i]
-        print(f"Fetch trunk {i}/{len(trunks) - 1}...")
+        print(f"Fetch trunk {i + 1}/{len(trunks)}...")
         self.ensure_download(trunk)
         if self.crypt_mode:
             self.ensure_decrypt(trunk)
