@@ -85,9 +85,7 @@ def parse_simple_kv_list(text: str):
 class M3U8Parser:
     class Stage(enum.Enum):
         init = enum.auto()
-        header_or_trunk_key_or_end = enum.auto()
-        trunk_key_or_end = enum.auto()
-        trunk_value = enum.auto()
+        trunk = enum.auto()
         end = enum.auto()
 
     def __init__(self):
@@ -99,52 +97,42 @@ class M3U8Parser:
     def parse(cls, text: str):
         parser = cls()
         for line in text.splitlines():
-            parser.input(line.strip())
-        if parser.stage is not parser.Stage.end:
-            raise Exception("Parse not end", parser.stage)
+            line = line.strip()
+            if len(line) > 0:  # skip empty lines
+                parser.input(line)
         return parser.headers, parser.trunks
 
     def input(self, line: str):
         match self.stage:
             case self.Stage.init:
                 self.input_init(line)
-            case self.Stage.header_or_trunk_key_or_end:
-                self.input_header_or_trunk_key_or_end(line)
-            case self.Stage.trunk_key_or_end:
-                self.input_trunk_key_or_end(line)
-            case self.Stage.trunk_value:
-                self.input_trunk_value(line)
+            case self.Stage.trunk:
+                self.input_trunk(line)
             case _:
-                raise Exception("Invalid stage", self.stage)
+                raise Exception("Invalid stage", self.stage, line)
 
     def input_init(self, line: str):
         if line == "#EXTM3U":
-            self.stage = self.Stage.header_or_trunk_key_or_end
+            self.stage = self.Stage.trunk
         else:
-            raise Exception("Invalid init", line)
+            raise Exception("Invalid init", self.stage, line)
 
-    def input_header_or_trunk_key_or_end(self, line: str):
+    def input_trunk(self, line: str):
         if line == "#EXT-X-ENDLIST":
             self.stage = self.Stage.end
-        elif line.startswith("#EXT-X"):
-            k, v = line.split(":", 1)
+        elif line.startswith("#EXT-X-"):
+            kv = line[7:].split(":", 1)
+            if len(kv) == 2:
+                k, v = kv
+                k, v = k.strip(), v.strip()
+            else:
+                (k,) = kv
+                k, v = k.strip(), ""
             self.headers[k] = v
         elif line.startswith("#EXTINF"):
-            self.stage = self.Stage.trunk_value
+            pass  # parse info lines
         else:
-            raise Exception("Invalid header or trunk key or end", line)
-
-    def input_trunk_key_or_end(self, line: str):
-        if line == "#EXT-X-ENDLIST":
-            self.stage = self.Stage.end
-        elif line.startswith("#EXTINF"):
-            self.stage = self.Stage.trunk_value
-        else:
-            raise Exception("Invalid trunk key or end", line)
-
-    def input_trunk_value(self, line: str):
-        self.trunks.append(line)
-        self.stage = self.Stage.trunk_key_or_end
+            self.trunks.append(line)
 
 
 class M3U8Downloader:
@@ -205,14 +193,14 @@ class M3U8Downloader:
         self.ensure_download(self.m3u8_meta)
         self.m3u8_meta = self.read_text(self.m3u8_meta)
         self.m3u8_headers, self.m3u8_trunks = M3U8Parser.parse(self.m3u8_meta)
-        if "#EXT-X-KEY" not in self.m3u8_headers:
+        if "KEY" not in self.m3u8_headers:
             self.crypt_mode = False
         else:
             self.crypt_mode = True
             self.fetch_crypt_key()
 
     def fetch_crypt_key(self):
-        self.m3u8_key_meta = parse_simple_kv_list(self.m3u8_headers["#EXT-X-KEY"])
+        self.m3u8_key_meta = parse_simple_kv_list(self.m3u8_headers["KEY"])
         if not self.m3u8_key_meta["METHOD"].startswith("AES-"):
             raise Exception("Invalid method", self.m3u8_key_meta)
         if not self.m3u8_key_meta["IV"].startswith("0x"):
