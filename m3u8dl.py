@@ -1,3 +1,6 @@
+#!/usr/bin/env python
+
+from argparse import ArgumentParser
 import os.path
 import io
 import subprocess
@@ -139,7 +142,7 @@ class M3U8Downloader:
     def __init__(
         self,
         url,
-        headers,
+        headers={},
         download_path="download/",
         index_name="_index.txt",
         output_name="_output.mp4",
@@ -156,11 +159,9 @@ class M3U8Downloader:
         self.check_mode = check_mode
 
     @classmethod
-    def from_json(cls, json_path, **kwargs):
-        params = read_json(json_path)
-        url = params["url"]
-        headers = params["headers"]
-        return cls(url, headers, **kwargs)
+    def from_json(cls, path):
+        kwargs = read_json(path)
+        return cls(**kwargs)
 
     def read_bytes(self, name):
         path = self.download_path + name
@@ -262,3 +263,29 @@ class M3U8Downloader:
             ],
             cwd=self.download_path,
         )
+
+
+def main():
+    parser = ArgumentParser()
+    parser.add_argument("-t", "--task", default="task.json")
+    parser.add_argument("--check-mode", action="store_true", default=False)
+    parser.add_argument("--command", default="fetch_async")
+    args = parser.parse_args()
+    md = M3U8Downloader.from_json(args.task)
+    if args.check_mode:
+        md.check_mode = True
+    match args.command:
+        case "fetch_async":
+            md.fetch_async()
+            md.gen_index()
+        case "fetch_sync":
+            md.fetch()
+            md.gen_index()
+        case "concat":
+            md.ffmpeg_concat()
+        case command:
+            raise Exception("Invalid command", command)
+
+
+if __name__ == "__main__":
+    main()
